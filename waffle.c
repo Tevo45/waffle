@@ -5,13 +5,14 @@
 #include <bio.h>
 #include <String.h>
 
+char *querystr;
 char *stubhost   = "error.host\t1";
 char *gopherhost = "localhost";
 char *spacetab   = "    ";
 char *srvroot    = "./";
-char *defprog    = "	\n\
-	info $user@$sysname:$querystr\n\
-	dir 'my home!' /usr/tevo\n\
+char *defprog    = "\n\
+	info you seem to be lost...\n\
+	dir 'back home' /\n\
 ";
 
 enum
@@ -59,7 +60,7 @@ opforcmd(char* cmd)
 		char *k;
 		int op;
 	} ops[] = {
-		{"#",		OP_COMMENT},
+		{"--",		OP_COMMENT},
 		{"exec",	OP_EXEC},
 
 		{"info",	GOPHER_INFO},
@@ -89,6 +90,46 @@ opforcmd(char* cmd)
 		return *cmd;
 
 	return -1;
+}
+
+char*
+readall(char *path)
+{
+	char *buf;
+	int fd, bsize = 4096;
+
+	if((fd = open(path, OREAD)) < 0)
+		sysfatal("open: %r");
+
+	buf = malloc(bsize);
+	if(buf == nil)
+		sysfatal("malloc: %r");
+
+	for(int c = 0; read(fd, buf+(c*bsize), bsize) != 0; c++)
+	{
+		buf = realloc(buf, ((c+2)*bsize));
+		if(buf == nil)
+			sysfatal("realloc: %r");
+	}
+
+	close(fd);
+	return buf;
+}
+
+/*
+ * Funny bug, sometimes strings allocated on multiple invocations
+ * of the same function ends up with leftovers from previous invocations,
+ * probably getting assigned the same memory location as before (which
+ * wasn't cleaned up, so it's full of garbage), and the string "picks it up".
+ * s_terminate doesn't seem to do it's job, somehow, or I'm doing something
+ * wrong.
+ * FIXME investigate this
+ */
+void
+s_cleanup(String *str)
+{
+	for(char *c = str->base; c < str->end; c++)
+		*c = 0;
 }
 
 /*
@@ -162,6 +203,7 @@ varfmt(Fmt *fmt)
 			s_putc(out, *str);
 		}
 
+	s_terminate(out);
 	ret = fmtprint(fmt, "%G", s_to_c(out));
 
 	s_free(scratch);
@@ -186,7 +228,7 @@ info(char *fmt, ...)
 	return n;
 }
 
-#pragma varargck argpos info 1
+#pragma varargck argpos error 1
 int
 error(char *fmt, ...)
 {
@@ -210,7 +252,8 @@ entry(char type, char *name, char *path, char *host, char *port)
 
 /*
  * FIXME we should timeout at some point, so a user can't take us down
- * by opening connections but never sending a CRLF
+ * by opening connections but never sending a CRLF.
+ * Maybe it's not our job.
  */
 String*
 readrequest(void)
@@ -237,11 +280,34 @@ parsepath(char* req)
 	return strdup(req);
 }
 
+/* FIXME disallow requests outside gopherroot */
 String*
 getprog(char *path)
 {
-	/* FIXME actually read index.waffle */
-	return s_copy(defprog);
+	String *prog;
+	char *apath, buf[4096];
+	int fd, n;
+
+	apath = smprint("%s/%s", srvroot, path);
+	if(apath == nil)
+		sysfatal("smprint: %r");
+
+	if(chdir(apath) != 0)
+	{
+		free(apath);
+		return s_copy(defprog);
+	}
+	free(apath);
+
+	if((fd = open("index.waffle", OREAD)) < 0)
+		return s_copy(defprog);
+
+	prog = s_new();
+	while((n = read(fd, buf, sizeof(buf))) != 0)
+		s_memappend(prog, buf, n);
+
+	close(fd);
+	return prog;
 }
 
 String*
@@ -256,13 +322,7 @@ nextcomm(String *prog)
 		return nil;
 
 	comm = s_new();
-	/*
-	 * funny bug, not sure what triggers this.
-	 * maybe we repeatedly get the same memory block
-	 * and the leftovers end up being used?
-	 */
-	for(char *ptr = comm->base; ptr != comm->end; ptr++)
-		*ptr = 0;
+	s_cleanup(comm);
 
 	for(; *prog->ptr != '\0'; prog->ptr++)
 	{
@@ -273,7 +333,7 @@ nextcomm(String *prog)
 
 	s_terminate(comm);
 	s_restart(comm);
-	
+
 	return comm;
 }
 
@@ -296,7 +356,7 @@ parseentry(int op, String *line)
 				s_append(p[c], defval[c]);
 			else
 			{
-				fprint(2, "incomplete command '%c'", op);
+				fprint(2, "incomplete command '%c'\n", op);
 				goto cleanup;
 			}
 	}
@@ -305,6 +365,33 @@ cleanup:
 	for(int c = 0; c < 4; c++)
 		if(p[c] != nil)
 			s_free(p[c]);
+}
+
+void
+shellexec(char *cmd)
+{
+	Waitmsg *msg;
+	char *argv[] = { "/bin/rc", "-c", cmd };
+	int rcin[2];
+	pipe(rcin);
+	switch(rfork(RFFDG|RFPROC|RFMEM|RFNAMEG|RFNOTEG|RFREND))
+	{
+	case 0:
+		close(0);
+		dup(rcin[0], 0);
+		close(rcin[0]);
+		exec("/bin/rc", argv);
+		sysfatal("exec: %r");
+		break;
+	case -1:
+		sysfatal("rfork: %r");
+		break;
+	default:
+		write(rcin[1], querystr, strlen(querystr));
+		msg = wait();
+		if(strlen(msg->msg) != 0)
+			fprint(2, "rc: %s\n", msg->msg);
+	}
 }
 
 void
@@ -318,12 +405,13 @@ interprog(String *prog)
 	while((line = nextcomm(prog)) != nil)
 	{
 		s_parse(line, curtok);
+		s_terminate(curtok);
 		switch(op = opforcmd(s_to_c(curtok)))
 		{
 		case OP_COMMENT:
 			break;
 		case OP_EXEC:
-			error("exec not implemented (yet)");
+			shellexec(line->ptr);
 			break;
 		case GOPHER_INFO:
 			info("%V", line->ptr);
@@ -347,15 +435,17 @@ void
 main(int argc, char **argv)
 {
 	String *req, *prog;
-	char *path;
+	char *path, pwd[512];
 
 	ARGBEGIN {
 	case 'r':
 		srvroot = EARGF(usage());
 		break;
 	case 'd':
-		fprint(2, "defprog: not implemented\n");
-		exits("noimpl");
+		defprog = readall(EARGF(usage()));
+		if(defprog == nil)
+			sysfatal("readall: %r");
+		break;
 	case 'h':
 		gopherhost = EARGF(usage());
 		break;
@@ -366,7 +456,14 @@ main(int argc, char **argv)
 	fmtinstall('G', gopherfmt);
 	fmtinstall('V', varfmt);
 
+	if(chdir(srvroot) != 0)
+		sysfatal("chdir: %r");
+
+	if(getwd(pwd, sizeof(pwd)) == 0)
+		sysfatal("getwd: %r");
+
 	req = readrequest();
+	querystr = s_to_c(req);
 
 	path = parsepath(s_to_c(req));
 	if(path == nil)
@@ -375,6 +472,7 @@ main(int argc, char **argv)
 		goto end;
 	}
 
+	putenv("gopherroot", pwd);
 	putenv("gopherhost", gopherhost);
 	putenv("querystr", s_to_c(req));
 	putenv("pathstr", path);
