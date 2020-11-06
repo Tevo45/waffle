@@ -5,11 +5,13 @@
 #include <bio.h>
 #include <String.h>
 
-char *stubhost = "error.host\t1";
-char *spacetab = "    ";
-char *srvroot  = "./";
-char *defprog  = "	\n\
+char *stubhost   = "error.host\t1";
+char *gopherhost = "localhost";
+char *spacetab   = "    ";
+char *srvroot    = "./";
+char *defprog    = "	\n\
 	info $user@$sysname:$querystr\n\
+	dir 'my home!' /usr/tevo\n\
 ";
 
 enum
@@ -45,7 +47,7 @@ enum
 void
 usage(void)
 {
-	fprint(2, "usage: [-r root] [-d defprog] %s", argv0);
+	fprint(2, "usage: [-r root] [-d defprog] [-h hostaddr] %s", argv0);
 	exits("usage");
 }
 
@@ -276,6 +278,36 @@ nextcomm(String *prog)
 }
 
 void
+parseentry(int op, String *line)
+{
+	char *defval[] = {
+		nil, nil,
+		[2] = gopherhost,
+		[3] = "70",
+	};
+	String *p[] = {nil, nil, nil, nil};
+	for(int c = 0; c < 4; c++)
+	{
+		p[c] = s_new();
+		s_parse(line, p[c]);
+		s_terminate(p[c]);
+		if(strlen(s_to_c(p[c])) == 0)
+			if(defval[c] != nil)
+				s_append(p[c], defval[c]);
+			else
+			{
+				fprint(2, "incomplete command '%c'", op);
+				goto cleanup;
+			}
+	}
+	entry((char)op, s_to_c(p[0]), s_to_c(p[1]), s_to_c(p[2]), s_to_c(p[3]));
+cleanup:
+	for(int c = 0; c < 4; c++)
+		if(p[c] != nil)
+			s_free(p[c]);
+}
+
+void
 interprog(String *prog)
 {
 	int op;
@@ -290,14 +322,19 @@ interprog(String *prog)
 		{
 		case OP_COMMENT:
 			break;
+		case OP_EXEC:
+			error("exec not implemented (yet)");
+			break;
 		case GOPHER_INFO:
 			info("%V", line->ptr);
 			break;
 		case GOPHER_ERR:
 			error("%V", line->ptr);
 			break;
-		case -1:
 		default:
+			parseentry(op, line);
+			break;
+		case -1:
 			error("command not implemented: %G", s_to_c(curtok));
 		}
 		s_reset(curtok);
@@ -319,6 +356,9 @@ main(int argc, char **argv)
 	case 'd':
 		fprint(2, "defprog: not implemented\n");
 		exits("noimpl");
+	case 'h':
+		gopherhost = EARGF(usage());
+		break;
 	default:
 		usage();
 	} ARGEND;
@@ -327,23 +367,26 @@ main(int argc, char **argv)
 	fmtinstall('V', varfmt);
 
 	req = readrequest();
+
 	path = parsepath(s_to_c(req));
 	if(path == nil)
 	{
 		error("cannot parse request: %r");
 		goto end;
 	}
+
+	putenv("gopherhost", gopherhost);
+	putenv("querystr", s_to_c(req));
+	putenv("pathstr", path);
+
 	prog = getprog(path);
 	if(prog == nil)
 	{
-		error("cannot find index for %s: %r", path);
+		error("cannot find index for %G: %r", path);
 		goto end;
 	}
 	interprog(prog);
-	
-//	servedir(path);
-//	info("-----");
-//	info("waffle on %s (plan9/%s)", getenv("sysname"), getenv("cputype"));
+
 end:
 	print(".");
 	/*
