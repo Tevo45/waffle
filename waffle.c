@@ -8,17 +8,13 @@
 char *stubhost = "error.host\t1";
 char *spacetab = "    ";
 char *srvroot  = "./";
-char *defprog  = "	\
-	# This is a comment and shouldn't be considered\n\
-	info system is $sysname on $cputype\n\
-	info $objtype \\$notavar $nonexistant \\\\$yay\n\
-	lsdir .\n		\
+char *defprog  = "	\n\
+	info $user@$sysname:$querystr\n\
 ";
 
 enum
 {
 	OP_COMMENT,
-	OP_LSDIR,
 	OP_EXEC,
 };
 
@@ -62,7 +58,6 @@ opforcmd(char* cmd)
 		int op;
 	} ops[] = {
 		{"#",		OP_COMMENT},
-		{"lsdir",	OP_LSDIR},
 		{"exec",	OP_EXEC},
 
 		{"info",	GOPHER_INFO},
@@ -95,14 +90,14 @@ opforcmd(char* cmd)
 }
 
 /*
- * Like %s, but replaces tabs with spacetab and interpolates variables
+ * Like %s, but replaces tabs with spacetab
  */
 #pragma varargck type "G" char*
 int
 gopherfmt(Fmt *fmt)
 {
 	String *scratch;
-	char *str, *buf;
+	char *str;
 	int ret = 0;
 
 	scratch = s_new();
@@ -113,11 +108,36 @@ gopherfmt(Fmt *fmt)
 		case '\t':
 			ret = fmtprint(fmt, "%s", spacetab);
 			break;
+		default:
+			fmtprint(fmt, "%c", *str);
+		}
+
+	s_free(scratch);
+	return ret;
+}
+
+/*
+ * Like %G, but interpolates variables
+ */
+#pragma varargck type "V" char*
+int
+varfmt(Fmt *fmt)
+{
+	String *out, *scratch;
+	char *str, *buf;
+	int ret;
+
+	scratch = s_new();
+	out = s_new();
+	str = va_arg(fmt->args, char*);
+	for(; *str != '\0'; str++)
+		switch(*str)
+		{
 		case '$':
 			s_restart(scratch);
 
 			str++;
-			while(!isspace(*str))
+			while(isalnum(*str))
 				s_putc(scratch, *str++);
 			str--;
 			s_terminate(scratch);
@@ -127,8 +147,7 @@ gopherfmt(Fmt *fmt)
 				fprint(2, "getenv: %r\n");
 			else
 			{
-				/* FIXME using %G here resolves variables recursively */
-				fmtprint(fmt, "%G", buf);
+				s_append(out, buf);
 				free(buf);
 			}
 
@@ -138,10 +157,14 @@ gopherfmt(Fmt *fmt)
 			if(*(str+1) == '$')
 				str++;
 		default:
-			fmtprint(fmt, "%c", *str);
+			s_putc(out, *str);
 		}
 
+	ret = fmtprint(fmt, "%G", s_to_c(out));
+
 	s_free(scratch);
+	s_free(out);
+
 	return ret;
 }
 
@@ -153,7 +176,7 @@ info(char *fmt, ...)
 	va_list args;
 
 	va_start(args, fmt);
-	fmt = smprint("i%G\t\t%s\r\n", fmt, stubhost);
+	fmt = smprint("i%V\t\t%s\r\n", fmt, stubhost);
 	n = vfprint(1, fmt, args);
 	free(fmt);
 	va_end(args);
@@ -169,7 +192,7 @@ error(char *fmt, ...)
 	va_list args;
 
 	va_start(args, fmt);
-	fmt = smprint("3%G\t\t%s\r\n", fmt, stubhost);
+	fmt = smprint("3%V\t\t%s\r\n", fmt, stubhost);
 	n = vfprint(1, fmt, args);
 	free(fmt);
 	va_end(args);
@@ -178,9 +201,9 @@ error(char *fmt, ...)
 }
 
 int
-entry(char type, char *name, char *path, char *host, int port)
+entry(char type, char *name, char *path, char *host, char *port)
 {
-	return print("%c%G\t%G\t%G\t%d\r\n", type, name, path, host, port);
+	return print("%c%V\t%V\t%V\t%V\r\n", type, name, path, host, port);
 }
 
 /*
@@ -212,43 +235,6 @@ parsepath(char* req)
 	return strdup(req);
 }
 
-void
-servedir(char *path)
-{
-	Dir *dir;
-	long n;
-	int fd;
-
-	dir = dirstat(path);
-	if(dir == nil)
-	{
-	error:
-		info("Error: %r");
-		entry(GOPHER_DIR, "/", "", "neptune.shrine", 70);
-		return;
-	}
-	if(dir->qid.type&QTDIR)
-	{
-		free(dir);
-		info("%G", path);
-		fd = open(path, OREAD);
-		if(fd < 0)
-			goto error;
-		n = dirreadall(fd, &dir);
-		if(n < 0)
-			goto error;
-		for(int c = 0; c < n; c++)
-		{
-			char *fpath = smprint("%s/%s", path, dir[c].name);
-			char type = dir[c].mode&DMDIR ? GOPHER_DIR : GOPHER_FILE;
-			entry(type, dir[c].name, fpath, "neptune.shrine", 70);
-			free(fpath);
-		}
-	}
-	else
-		info("not supported...");
-}
-
 String*
 getprog(char *path)
 {
@@ -268,6 +254,13 @@ nextcomm(String *prog)
 		return nil;
 
 	comm = s_new();
+	/*
+	 * funny bug, not sure what triggers this.
+	 * maybe we repeatedly get the same memory block
+	 * and the leftovers end up being used?
+	 */
+	for(char *ptr = comm->base; ptr != comm->end; ptr++)
+		*ptr = 0;
 
 	for(; *prog->ptr != '\0'; prog->ptr++)
 	{
@@ -297,14 +290,11 @@ interprog(String *prog)
 		{
 		case OP_COMMENT:
 			break;
-		case OP_LSDIR:
-			servedir("/usr/tevo");
-			break;
 		case GOPHER_INFO:
-			info("%G", line->ptr);
+			info("%V", line->ptr);
 			break;
 		case GOPHER_ERR:
-			error("%G", line->ptr);
+			error("%V", line->ptr);
 			break;
 		case -1:
 		default:
@@ -334,6 +324,7 @@ main(int argc, char **argv)
 	} ARGEND;
 
 	fmtinstall('G', gopherfmt);
+	fmtinstall('V', varfmt);
 
 	req = readrequest();
 	path = parsepath(s_to_c(req));
